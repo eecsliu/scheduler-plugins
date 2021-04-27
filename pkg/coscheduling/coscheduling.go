@@ -21,16 +21,15 @@ import (
 	"encoding/json"
 	"fmt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -39,7 +38,6 @@ import (
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 	"k8s.io/kubernetes/pkg/scheduler/util"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
 )
 
 // Args defines the scheduling parameters for Coscheduling plugin.
@@ -57,30 +55,30 @@ type Args struct {
 type Coscheduling struct {
 	frameworkHandle framework.FrameworkHandle
 	podLister       corelisters.PodLister
-	clientSet		*kubernetes.Clientset
 	// key is <namespace>/<PodGroup name> and value is *PodGroupInfo.
 	podGroupInfos sync.Map
 	// clock is used to get the current time.
 	clock util.Clock
 	// args is coscheduling parameters.
 	args Args
-	// waitingPods is used to track what Pods are waiting for determined-preemption.
+	// waitingPods is used to track what Pods are currently being scheduled.
 	waitingGroups map[string]*waitingGroup
-	// refresh holds the timestamp the group was last updated. The plugin will check
+	// If a podgroup has not been encountered, we refresh our cached information
+	encounteredGroups map[string]bool
+	// creation holds the timestamp the group was last updated. The plugin will check
 	// the status of all podgroups after PodScheduleTimeout seconds. If a PodGroup
 	// has been deleted while it is waiting to be scheduled, it will be replaced
-	refresh time.Time
+	creation time.Time
 }
 
 type waitingGroup struct {
-	name string
-	pods map[string]bool
-	preempting bool
-	approved bool
-	// priority of the pod that is waiting. If a higher priority job arrives, its PodGroup
-	// will replace the currently waiting PodGroup.
-	priority int32
+	name        string
+	pods        map[string]bool
+	preempting  bool
+	approved    bool
+	priority    int32
 	tolerations []v1.Toleration
+	selector    map[string]string
 }
 
 // PodGroupInfo is a wrapper to a PodGroup with additional information.
@@ -125,7 +123,7 @@ const (
 	// PodGroupMinAvailable specifies the minimum number of pods to be scheduled together in a pod group.
 	PodGroupMinAvailable = "pod-group.scheduling.sigs.k8s.io/min-available"
 	// PodScheduleTimeout is the number of seconds before a pod is checked to make sure it isn't deleted
-	PodScheduleTimeout = 10
+	PodScheduleTimeout = 1
 )
 
 // Name returns name of the plugin. It is used in logs, etc.
@@ -145,26 +143,14 @@ func New(config *runtime.Unknown, handle framework.FrameworkHandle) (framework.P
 		return nil, err
 	}
 
-	clusterConfig, err := rest.InClusterConfig()
-	if err != nil {
-		klog.Errorf("Unable to get the kubernetes cluster configuration: %w", err)
-		return nil, err
-	}
-
-	clientset, err := kubernetes.NewForConfig(clusterConfig)
-	if err != nil {
-		klog.Errorf("Unable to create a client configuration: %w", err)
-		return nil, err
-	}
-
-
 	podLister := handle.SharedInformerFactory().Core().V1().Pods().Lister()
 	cs := &Coscheduling{frameworkHandle: handle,
-		podLister: podLister,
-		clientSet: clientset,
-		clock:     util.RealClock{},
-		args:      args,
+		podLister:     podLister,
+		clock:         util.RealClock{},
+		args:          args,
 		waitingGroups: map[string]*waitingGroup{},
+		encounteredGroups: map[string]bool{},
+		creation:      time.Now(),
 	}
 	podInformer := handle.SharedInformerFactory().Core().V1().Pods().Informer()
 	podInformer.AddEventHandler(
@@ -276,8 +262,8 @@ func (cs *Coscheduling) PreemptionTag(pod *v1.Pod) {
 
 	payloadBytes, _ := json.Marshal(payload)
 
-	_, err := cs.clientSet.CoreV1().Pods("default").Patch(context.TODO(), pod.Name, types.JSONPatchType,
-		payloadBytes, metav1.PatchOptions{})
+	_, err := cs.frameworkHandle.ClientSet().CoreV1().Pods("default").Patch(
+		context.TODO(), pod.Name, types.JSONPatchType, payloadBytes, metav1.PatchOptions{})
 	if err == nil {
 		klog.V(3).Infof("Tagged pod %v for preemption", pod.Name)
 	} else {
@@ -298,41 +284,30 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 	}
 	pgMinAvailable := pgInfo.minAvailable
 
-	cs.frameworkHandle.SnapshotSharedLister().NodeInfos()
-
-	if len(cs.waitingGroups) == 0 {
+	waitingTime := time.Now().Sub(cs.creation)
+	if _, ok := cs.encounteredGroups[pgInfo.name]; !ok {
+		klog.V(9).Infof("INFO: encountered a new pod group, refreshing info")
 		cs.getNewWaitingGroups()
-		if len(cs.waitingGroups) == 0 {
-			return framework.NewStatus(framework.UnschedulableAndUnresolvable,
-				"No PodGroups are ready to be scheduled")
-		}
-
-		klog.V(3).Infof("INFO: The following PodGroups are on deck. All other groups will be blocked")
-		for _, group := range cs.waitingGroups {
-			klog.V(3).Infof("%v\n", group.name)
-		}
-	} else { // either it matches something in the list or it doesn't. If it doesn't, add. If it does, check timestamps.
-		waitingTime := time.Now().Sub(cs.refresh)
-		if waitingTime > time.Duration(PodScheduleTimeout) * time.Second {
-			cs.getNewWaitingGroups()
-		}
+	} else if waitingTime > time.Duration(PodScheduleTimeout)*time.Second {
+		klog.V(9).Infof("INFO: waiting groups timed out, refreshing info")
+		cs.getNewWaitingGroups()
 	}
 	if _, ok := cs.waitingGroups[pgInfo.name]; !ok {
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable,
-			"PodGroup rejected because higher priority PodGroups exist.")
+			"PodGroup rejected because it is not ready or higher priority PodGroups exist.")
 	}
 
 	group := cs.waitingGroups[pgInfo.name]
 
 	nodesAvailable := cs.calculateAvailableNodes(pgInfo.name)
 
-	if !group.approved && pgMinAvailable > 0{
+	if !group.approved && pgMinAvailable > 0 {
 		if nodesAvailable < pgMinAvailable {
 			if group.preempting {
 				return framework.NewStatus(framework.UnschedulableAndUnresolvable,
 					"Determined preemption is in progress")
 			} else {
-				cs.preemptPods(pgMinAvailable, pod)
+				cs.preemptPods(pgInfo.name)
 				return framework.NewStatus(framework.UnschedulableAndUnresolvable,
 					"Determined preemption has been initiated")
 			}
@@ -342,56 +317,12 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 	delete(group.pods, pod.Name)
 	if len(group.pods) == 0 {
 		delete(cs.waitingGroups, pgInfo.name)
+		cs.encounteredGroups = map[string]bool{}
 	} else {
 		group.approved = true
 	}
 
 	return framework.NewStatus(framework.Success, "")
-}
-
-func (cs *Coscheduling) preemptPods(pgMinAvailable int, pod *v1.Pod) {
-	klog.V(3).Infof("INFO: Preemption required! Finding preemption candidates")
-	podsList := cs.getBoundPods("", "default", true)
-
-	sort.Slice(podsList, func(i, j int) bool {
-		if *podsList[i].Spec.Priority == *podsList[j].Spec.Priority {
-			return podsList[i].CreationTimestamp.After(podsList[j].CreationTimestamp.Time)
-		}
-		return *podsList[i].Spec.Priority < *podsList[j].Spec.Priority
-	})
-
-	freed := 0
-	lastPg := ""
-	preemptionCandidates := make([]*v1.Pod, pgMinAvailable)
-	for _, p := range podsList {
-		if *p.Spec.Priority >= *pod.Spec.Priority {
-			break
-		} else if lastPg != "" && lastPg != p.Labels[PodGroupName] {
-			break
-		} else {
-			if !cs.compareTolerations(pod.Spec.Tolerations, p.Spec.Tolerations) {
-				continue
-			}
-			preemptionCandidates[freed] = p
-			freed += 1
-		}
-
-		if freed >= pgMinAvailable && lastPg == "" {
-			lastPg = p.Labels[PodGroupName]
-		}
-	}
-
-	if freed < pgMinAvailable {
-		klog.V(3).Infof("INFO: No preemption occurred. Not enough nodes are able to be freed")
-		return
-	}
-
-	for _, p := range preemptionCandidates {
-		klog.V(3).Infof("INFO: Preempting pod %s", p.Name)
-		cs.PreemptionTag(p)
-	}
-
-	cs.waitingGroups[pod.Labels[PodGroupName]].preempting = true
 }
 
 // PreFilterExtensions returns nil.
@@ -472,60 +403,6 @@ func GetPodGroupLabels(pod *v1.Pod) (string, int, error) {
 	return podGroupName, minNum, nil
 }
 
-func (cs *Coscheduling) calculateAvailableNodes(podgroup string) int {
-	tolerations := cs.waitingGroups[podgroup].tolerations
-
-	assignedNodes := map[string]bool{}
-	podsList := cs.getBoundPods("", "default", false)
-	for _, pod := range podsList {
-		assignedNodes[pod.Spec.NodeName] = true
-	}
-
-	nodesAvailable := 0
-	for _, node := range cs.getAllNodes() {
-		taints, err := node.Taints()
-		if err != nil {
-			continue
-		}
-		if !cs.doesTolerate(tolerations, taints) {
-			continue
-		}
-		// if it does tolerate and there is not an assigned node to it, we're ok.
-		if _, ok := assignedNodes[node.Node().Name]; !ok {
-			nodesAvailable += 1
-		}
-	}
-	return nodesAvailable
-}
-
-func (cs *Coscheduling) doesTolerate(tolerations []v1.Toleration, taints []v1.Taint) bool {
-	//check this logic, do they have to be the same length?
-	if len(tolerations) != len(taints) {
-		return false
-	}
-	taintMap := map[int]v1.Taint{}
-	for i, taint := range taints {
-		taintMap[i] = taint
-	}
-	for _, toleration := range tolerations {
-		found := -1
-		if len(taintMap) == 0 {
-			break //and return true?
-		}
-		for k, t := range taintMap {
-			if toleration.ToleratesTaint(&t) {
-				found = k
-				break
-			}
-		}
-		if found < 0 {
-			return false
-		}
-		delete(taintMap, found)
-	}
-	return true
-}
-
 func (cs *Coscheduling) calculateTotalPods(podGroupName, namespace string) int {
 	// TODO get the total pods from the scheduler cache and queue instead of the hack manner.
 	selector := labels.Set{PodGroupName: podGroupName}.AsSelector()
@@ -537,11 +414,53 @@ func (cs *Coscheduling) calculateTotalPods(podGroupName, namespace string) int {
 	return len(pods)
 }
 
-func (cs *Coscheduling) getNewWaitingGroups() { // TODO new: double check this function
+// markPodGroupAsExpired set the deletionTimestamp of PodGroup to mark PodGroup as expired.
+func (cs *Coscheduling) markPodGroupAsExpired(obj interface{}) {
+	pod := obj.(*v1.Pod)
+	podGroupName, podMinAvailable, _ := GetPodGroupLabels(pod)
+	if len(podGroupName) == 0 || podMinAvailable == 0 {
+		return
+	}
+
+	pgKey := fmt.Sprintf("%v/%v", pod.Namespace, podGroupName)
+	// If it's a PodGroup and present in PodGroupInfos, set its deletionTimestamp.
+	value, exist := cs.podGroupInfos.Load(pgKey)
+	if !exist {
+		return
+	}
+	pgInfo := value.(*PodGroupInfo)
+	if pgInfo.deletionTimestamp == nil {
+		now := cs.clock.Now()
+		pgInfo.deletionTimestamp = &now
+		cs.podGroupInfos.Store(pgKey, pgInfo)
+	}
+}
+
+// responsibleForPod selects pod that belongs to a PodGroup.
+func responsibleForPod(pod *v1.Pod) bool {
+	podGroupName, podMinAvailable, _ := GetPodGroupLabels(pod)
+	if len(podGroupName) == 0 || podMinAvailable == 0 {
+		return false
+	}
+	return true
+}
+
+func (cs *Coscheduling) podGroupInfoGC() {
+	cs.podGroupInfos.Range(func(key, value interface{}) bool {
+		pgInfo := value.(*PodGroupInfo)
+		if pgInfo.deletionTimestamp != nil && pgInfo.deletionTimestamp.Add(time.Duration(cs.args.PodGroupExpirationTimeSeconds)*time.Second).Before(cs.clock.Now()) {
+			klog.V(3).Infof("%v is out of date and has been deleted in PodGroup GC", key)
+			cs.podGroupInfos.Delete(key)
+		}
+		return true
+	})
+}
+
+func (cs *Coscheduling) getNewWaitingGroups() {
 	// updates cs.waitingGroups to everything that is still alive
 	podsList := cs.getWaitingPods("default")
 	if podsList == nil || len(podsList.Items) == 0 {
-		cs.waitingGroups = map[string]*waitingGroup{} // len == 0
+		cs.waitingGroups = map[string]*waitingGroup{}
 	}
 	sort.Slice(podsList.Items, func(i, j int) bool {
 		if *podsList.Items[i].Spec.Priority == *podsList.Items[j].Spec.Priority {
@@ -558,52 +477,77 @@ func (cs *Coscheduling) getNewWaitingGroups() { // TODO new: double check this f
 			return pgNamei < pgNamej
 		}
 		return *podsList.Items[i].Spec.Priority > *podsList.Items[j].Spec.Priority
-	}) //gets all the waiting pods and sorts by priority
+	})
 
-	cs.waitingGroups = map[string]*waitingGroup{} // do some filtering by taints here too
-	encounteredTolerations := [][]v1.Toleration{}
-	candidate := podsList.Items[0] //candidate is the first one in the list (highest priority)
+	cs.waitingGroups = map[string]*waitingGroup{}
+	cs.encounteredGroups = map[string]bool{}
+	var encounteredSelectors []map[string]string
+	candidate := podsList.Items[0]
 	pgName, minAvailable, _ := GetPodGroupLabels(&candidate)
 	pgPods := make(map[string]bool, minAvailable)
 	skip := false
 
-	for _, p := range podsList.Items { //for all the items,
+	for _, p := range podsList.Items {
 		skip = false
-		candidateGroup, exist := p.Labels[PodGroupName] // what is the group?
-		if exist && candidateGroup == pgName { //if it is the same group as the candidate, add a pod
+		candidateGroup, exist := p.Labels[PodGroupName]
+		if exist && candidateGroup == pgName {
 			pgPods[p.Name] = true
-		} else if exist && candidateGroup != pgName { // otherwise, we've encountered a new pg
-			if len(encounteredTolerations) > 0 { // if there are previous tolerations, check if they match
-				for _, toleration := range encounteredTolerations {
-					if cs.compareTolerations( //it matches an earlier encountered toleration
-						toleration, candidate.Spec.Tolerations) {
-						skip = true // skip adding it to the wait groups
+		} else if exist && candidateGroup != pgName {
+			if len(encounteredSelectors) > 0 {
+				for _, selector := range encounteredSelectors {
+					if cs.compareSelectors(candidate.Spec.NodeSelector, selector) {
+						skip = true
 						break
 					}
 				}
-
 			}
-			if len(pgPods) == minAvailable && !skip { //if length pods is not min available, we aren't ready. If skip, tolerations don't match
+			if len(pgPods) == minAvailable && !skip {
 				cs.waitingGroups[pgName] = &waitingGroup{
-					name:       pgName,
-					pods:       pgPods,
-					preempting: false,
-					approved:   false,
-					priority:   *candidate.Spec.Priority,
+					name:        pgName,
+					pods:        pgPods,
+					preempting:  false,
+					approved:    false,
+					priority:    *candidate.Spec.Priority,
 					tolerations: candidate.Spec.Tolerations,
+					selector:    candidate.Spec.NodeSelector,
 				}
-				encounteredTolerations = append(encounteredTolerations, candidate.Spec.Tolerations)
+				encounteredSelectors = append(encounteredSelectors, candidate.Spec.NodeSelector)
 			}
+			cs.encounteredGroups[pgName] = true
 			candidate = p
 			pgName, minAvailable, _ = GetPodGroupLabels(&candidate)
 			pgPods = make(map[string]bool, minAvailable)
-			pgPods[pgName] = true
+			pgPods[p.Name] = true
 		}
 	}
-	cs.refresh = time.Now()
+
+	if len(encounteredSelectors) > 0 { // if there are previous tolerations, check if they match
+		skip = false
+		for _, selector := range encounteredSelectors {
+			if cs.compareSelectors(candidate.Spec.NodeSelector, selector) {
+				skip = true // skip adding it to the wait groups
+				break
+			}
+		}
+
+	}
+	if len(pgPods) == minAvailable && !skip { //if length pods is not min available, we aren't ready. If skip, tolerations don't match
+		cs.waitingGroups[pgName] = &waitingGroup{
+			name:        pgName,
+			pods:        pgPods,
+			preempting:  false,
+			approved:    false,
+			priority:    *candidate.Spec.Priority,
+			tolerations: candidate.Spec.Tolerations,
+			selector:    candidate.Spec.NodeSelector,
+		}
+	}
+	cs.encounteredGroups[pgName] = true
+
+	cs.creation = cs.clock.Now()
 }
 
-func (cs *Coscheduling)getBoundPods(podGroupName, namespace string, determined bool) []*v1.Pod {
+func (cs *Coscheduling) getBoundPods(podGroupName, namespace string, determined bool) []*v1.Pod {
 	var pods []*v1.Pod
 	var err error
 	if podGroupName == "" {
@@ -636,10 +580,10 @@ func (cs *Coscheduling)getBoundPods(podGroupName, namespace string, determined b
 }
 
 func (cs *Coscheduling) getWaitingPods(namespace string) *v1.PodList {
-	pods, err := cs.clientSet.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
-			LabelSelector: "determined",
-			FieldSelector: "status.phase=Pending",
-		})
+	pods, err := cs.frameworkHandle.ClientSet().CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: "determined",
+		FieldSelector: "status.phase=Pending",
+	})
 
 	if err != nil {
 		klog.Error(err)
@@ -649,22 +593,9 @@ func (cs *Coscheduling) getWaitingPods(namespace string) *v1.PodList {
 	return pods
 }
 
-func (cs *Coscheduling) expExists(namespace string, name string) bool {
-	pods := cs.getWaitingPods(namespace)
-	if pods == nil {
-		return false
-	}
-
-	for _, pod := range pods.Items {
-		if pod.Labels[PodGroupName] == name {
-			return true
-		}
-	}
-	return false
-}
-
 func (cs *Coscheduling) getAllNodes() []*schedulernodeinfo.NodeInfo {
 	nodes, err := cs.frameworkHandle.SnapshotSharedLister().NodeInfos().List()
+
 	if err != nil {
 		klog.Error(err)
 		return nil
@@ -672,102 +603,146 @@ func (cs *Coscheduling) getAllNodes() []*schedulernodeinfo.NodeInfo {
 	return nodes
 }
 
-// markPodGroupAsExpired set the deletionTimestamp of PodGroup to mark PodGroup as expired.
-func (cs *Coscheduling) markPodGroupAsExpired(obj interface{}) {
-	pod := obj.(*v1.Pod)
-	podGroupName, podMinAvailable, _ := GetPodGroupLabels(pod)
-	if len(podGroupName) == 0 || podMinAvailable == 0 {
-		return
-	}
-
-	pgKey := fmt.Sprintf("%v/%v", pod.Namespace, podGroupName)
-	// If it's a PodGroup and present in PodGroupInfos, set its deletionTimestamp.
-	value, exist := cs.podGroupInfos.Load(pgKey)
-	if !exist {
-		return
-	}
-	pgInfo := value.(*PodGroupInfo)
-	if pgInfo.deletionTimestamp == nil {
-		now := cs.clock.Now()
-		pgInfo.deletionTimestamp = &now
-		cs.podGroupInfos.Store(pgKey, pgInfo)
-	}
-}
-
-func (cs *Coscheduling) compareTaints(t1, t2 []v1.Taint) bool {
-	if len(t1) != len(t2) {
-		return false
-	}
-
-	t1Map, t2Map := map[string]v1.TaintEffect{}, map[string]v1.TaintEffect{}
-
-	for _, taint := range t1 {
-		t1Map[taint.Key] = taint.Effect
-	}
-	for _, taint := range t2 {
-		t2Map[taint.Key] = taint.Effect
-	}
-
-	for key, effect := range t1Map {
-		if affect, ok := t2Map[key]; ok {
-			if effect == affect {
-				continue
-			} else {
-				return false
-			}
-		} else {
-			return false
-		}
-	}
-
-	return true
-}
-
-func (cs *Coscheduling) compareTolerations(t1, t2 []v1.Toleration) bool {
-	if len(t1) != len(t2) {
-		return false
-	}
-
-	t1Map, t2Map := map[string]v1.Toleration{}, map[string]v1.Toleration{}
-
-	for _, toleration := range t1 {
-		t1Map[toleration.Key] = toleration
-	}
-	for _, toleration := range t2 {
-		t2Map[toleration.Key] = toleration
-	}
-
-	for key, toleration1 := range t1Map {
-		if toleration2, ok := t2Map[key]; ok {
-			if toleration1.MatchToleration(&toleration2) {
-				continue
-			} else {
-				return false
-			}
-		} else {
-			return false
-		}
-	}
-
-	return true
-}
-
-// responsibleForPod selects pod that belongs to a PodGroup.
-func responsibleForPod(pod *v1.Pod) bool {
-	podGroupName, podMinAvailable, _ := GetPodGroupLabels(pod)
-	if len(podGroupName) == 0 || podMinAvailable == 0 {
-		return false
-	}
-	return true
-}
-
-func (cs *Coscheduling) podGroupInfoGC() {
-	cs.podGroupInfos.Range(func(key, value interface{}) bool {
-		pgInfo := value.(*PodGroupInfo)
-		if pgInfo.deletionTimestamp != nil && pgInfo.deletionTimestamp.Add(time.Duration(cs.args.PodGroupExpirationTimeSeconds)*time.Second).Before(cs.clock.Now()) {
-			klog.V(3).Infof("%v is out of date and has been deleted in PodGroup GC", key)
-			cs.podGroupInfos.Delete(key)
-		}
+func (cs *Coscheduling) compareSelectors(s1, s2 map[string]string) bool {
+	if s1 == nil && s2 == nil {
 		return true
+	}
+	if s1 == nil || s2 == nil {
+		return false
+	}
+
+	if len(s1) != len(s2) {
+		return false
+	}
+
+	for k, v := range s1 {
+		v2, ok := s2[k]
+		if !ok {
+			return false
+		}
+		if v != v2 {
+			return false
+		}
+	}
+	return true
+}
+
+func (cs *Coscheduling) doesTolerate(tolerations []v1.Toleration, taints []v1.Taint) bool {
+	tolerationMap := map[int]v1.Toleration{}
+	for i, toleration := range tolerations {
+		tolerationMap[i] = toleration
+	}
+
+	for _, taint := range taints {
+		found := -1
+		if len(tolerationMap) == 0 {
+			return false
+		}
+		for k, t := range tolerationMap {
+			if t.ToleratesTaint(&taint) {
+				found = k
+				break
+			}
+		}
+		if found < 0 { // if the taint can't find a matching toleration
+			return false
+		}
+		delete(tolerationMap, found)
+	}
+	return true
+}
+
+func (cs *Coscheduling) preemptPods(podgroup string) {
+	klog.V(3).Infof("INFO: Preemption required! Finding preemption candidates")
+	podsList := cs.getBoundPods("", "default", true)
+	group := cs.waitingGroups[podgroup]
+	pgMinAvailable := len(group.pods)
+
+	sort.Slice(podsList, func(i, j int) bool {
+		if *podsList[i].Spec.Priority == *podsList[j].Spec.Priority {
+			pgNamei, oki := podsList[i].Labels[PodGroupName]
+			pgNamej, okj := podsList[j].Labels[PodGroupName]
+			if !oki && !okj {
+				return podsList[j].CreationTimestamp.After(podsList[i].CreationTimestamp.Time)
+			} else if !oki {
+				return true
+			} else if !okj {
+				return false
+			}
+
+			return pgNamei < pgNamej
+		}
+		return *podsList[i].Spec.Priority < *podsList[j].Spec.Priority
 	})
+
+	freed := 0
+	lastPg := ""
+	preemptionCandidates := map[int]*v1.Pod{}
+	for _, p := range podsList {
+		if *p.Spec.Priority >= group.priority {
+			break
+		} else if lastPg != "" && lastPg != p.Labels[PodGroupName] {
+			break
+		} else {
+			if cs.compareSelectors(group.selector, p.Spec.NodeSelector) {
+				preemptionCandidates[freed] = p
+				freed += 1
+			}
+		}
+
+		if freed >= pgMinAvailable && lastPg == "" {
+			lastPg = p.Labels[PodGroupName]
+		}
+	}
+
+	if freed < pgMinAvailable {
+		klog.V(3).Infof("INFO: No preemption occurred. Not enough nodes are able to be freed")
+		return
+	}
+
+	for _, p := range preemptionCandidates {
+		klog.V(3).Infof("INFO: Preempting pod %s", p.Name)
+		cs.PreemptionTag(p)
+	}
+
+	group.preempting = true
+}
+
+func (cs *Coscheduling) calculateAvailableNodes(podgroup string) int {
+	assignedNodes := map[string]bool{}
+	podsList := cs.getBoundPods("", "default", false)
+	for _, pod := range podsList {
+		assignedNodes[pod.Spec.NodeName] = true
+	}
+
+	nodesAvailable := 0
+	for _, node := range cs.getAllNodes() {
+		failedSelector := false
+		for k, v := range cs.waitingGroups[podgroup].selector {
+			v2, ok := node.Node().Labels[k]
+			if !ok || v != v2 {
+				klog.V(9).Infof("NODE %v doesn't have the right label\n", node.Node().Name)
+				failedSelector = true
+				break
+			}
+		}
+		if failedSelector {
+			continue
+		}
+
+		taints, err := node.Taints()
+		if err != nil {
+			continue
+		}
+		if !cs.doesTolerate(cs.waitingGroups[podgroup].tolerations, taints) {
+			klog.V(9).Infof("NODE %v doesn't fit\n", node.Node().Name)
+			continue
+		}
+		// if it does tolerate and there is not an assigned node to it, we're ok.
+		if _, ok := assignedNodes[node.Node().Name]; !ok {
+			klog.V(9).Infof("NODE fits:", node.Node().Name)
+			nodesAvailable += 1
+		}
+	}
+	return nodesAvailable
 }
