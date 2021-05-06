@@ -69,6 +69,7 @@ type Coscheduling struct {
 	// the status of all podgroups after PodScheduleTimeout seconds. If a PodGroup
 	// has been deleted while it is waiting to be scheduled, it will be replaced
 	creation time.Time
+	noFit bool
 }
 
 type waitingGroup struct {
@@ -151,6 +152,7 @@ func New(config *runtime.Unknown, handle framework.FrameworkHandle) (framework.P
 		waitingGroups: map[string]*waitingGroup{},
 		encounteredGroups: map[string]bool{},
 		creation:      time.Now(),
+		noFit: 		   false,
 	}
 	podInformer := handle.SharedInformerFactory().Core().V1().Pods().Informer()
 	podInformer.AddEventHandler(
@@ -292,36 +294,45 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		klog.V(9).Infof("waiting groups timed out, refreshing info")
 		cs.getNewWaitingGroups()
 	}
-	if _, ok := cs.waitingGroups[pgInfo.name]; !ok {
-		return framework.NewStatus(framework.UnschedulableAndUnresolvable,
-			"PodGroup rejected because it is not ready or higher priority PodGroups exist.")
-	}
 
-	group := cs.waitingGroups[pgInfo.name]
+	//TODO: turn this into an if else statement
+	// add a variable that takes into account whether the highest priority job was scheduled or not
+	// if the variable is true, then allow through every pod and reset if it is able to schedule the
+	// waiting group. They will be preempted if necessary anyways.
+	if _, ok := cs.waitingGroups[pgInfo.name]; ok {
+		group := cs.waitingGroups[pgInfo.name]
 
-	nodesAvailable := cs.calculateAvailableNodes(pgInfo.name)
+		nodesAvailable := cs.calculateAvailableNodes(pgInfo.name)
 
-	if !group.approved && pgMinAvailable > 0 {
-		if nodesAvailable < pgMinAvailable {
-			if group.preempting {
-				return framework.NewStatus(framework.UnschedulableAndUnresolvable,
-					"Waiting for lower priority pods to be preempted")
-			} else {
-				cs.preemptPods(pgInfo.name)
-				return framework.NewStatus(framework.UnschedulableAndUnresolvable, "")
+		if !group.approved && pgMinAvailable > 0 {
+			if nodesAvailable < pgMinAvailable {
+				if group.preempting {
+					return framework.NewStatus(framework.UnschedulableAndUnresolvable,
+						"Waiting for lower priority pods to be preempted")
+				} else {
+					cs.preemptPods(pgInfo.name)
+					return framework.NewStatus(framework.UnschedulableAndUnresolvable, "")
+				}
 			}
 		}
+
+		delete(group.pods, pod.Name)
+		if len(group.pods) == 0 {
+			delete(cs.waitingGroups, pgInfo.name)
+			cs.encounteredGroups = map[string]bool{}
+		} else {
+			group.approved = true
+		}
+
+		klog.V(3).Infof("Pod %v in group %v has been approved", pod.Name, group.name)
+		return framework.NewStatus(framework.Success, "")
+	} else if cs.noFit {
+		klog.V(3).Infof("We are backfilling with pod %v!", pod.Name)
+		return framework.NewStatus(framework.Success, "")
 	}
 
-	delete(group.pods, pod.Name)
-	if len(group.pods) == 0 {
-		delete(cs.waitingGroups, pgInfo.name)
-		cs.encounteredGroups = map[string]bool{}
-	} else {
-		group.approved = true
-	}
-
-	return framework.NewStatus(framework.Success, "")
+	return framework.NewStatus(framework.UnschedulableAndUnresolvable,
+		"PodGroup rejected because it is not ready or higher priority PodGroups exist.")
 }
 
 // PreFilterExtensions returns nil.
@@ -696,6 +707,7 @@ func (cs *Coscheduling) preemptPods(podgroup string) {
 
 	if freed < pgMinAvailable {
 		klog.V(3).Infof("No preemption occurred. Not enough nodes are able to be freed")
+		cs.noFit = true
 		return
 	}
 
@@ -704,6 +716,7 @@ func (cs *Coscheduling) preemptPods(podgroup string) {
 	}
 
 	klog.V(3).Infof("Preemption of lower priority pods is in progress")
+	cs.noFit = false
 	group.preempting = true
 }
 
