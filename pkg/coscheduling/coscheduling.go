@@ -267,7 +267,7 @@ func (cs *Coscheduling) PreemptionTag(pod *v1.Pod) {
 	if err == nil {
 		klog.V(3).Infof("Tagged pod %v for preemption", pod.Name)
 	} else {
-		klog.V(3).Infof("WARNING: Unable to tag pod %v for preemption", pod.Name)
+		klog.V(3).Infof("Unable to tag pod %v for preemption", pod.Name)
 		klog.V(3).Infof("%v", err)
 	}
 }
@@ -286,10 +286,10 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 
 	waitingTime := time.Now().Sub(cs.creation)
 	if _, ok := cs.encounteredGroups[pgInfo.name]; !ok {
-		klog.V(9).Infof("INFO: encountered a new pod group, refreshing info")
+		klog.V(9).Infof("encountered a new pod group, refreshing info")
 		cs.getNewWaitingGroups()
 	} else if waitingTime > time.Duration(PodScheduleTimeout)*time.Second {
-		klog.V(9).Infof("INFO: waiting groups timed out, refreshing info")
+		klog.V(9).Infof("waiting groups timed out, refreshing info")
 		cs.getNewWaitingGroups()
 	}
 	if _, ok := cs.waitingGroups[pgInfo.name]; !ok {
@@ -305,11 +305,10 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		if nodesAvailable < pgMinAvailable {
 			if group.preempting {
 				return framework.NewStatus(framework.UnschedulableAndUnresolvable,
-					"Determined preemption is in progress")
+					"Waiting for lower priority pods to be preempted")
 			} else {
 				cs.preemptPods(pgInfo.name)
-				return framework.NewStatus(framework.UnschedulableAndUnresolvable,
-					"Determined preemption has been initiated")
+				return framework.NewStatus(framework.UnschedulableAndUnresolvable, "")
 			}
 		}
 	}
@@ -653,7 +652,7 @@ func (cs *Coscheduling) doesTolerate(tolerations []v1.Toleration, taints []v1.Ta
 }
 
 func (cs *Coscheduling) preemptPods(podgroup string) {
-	klog.V(3).Infof("INFO: Preemption required! Finding preemption candidates")
+	klog.V(3).Infof("Preemption required! Finding preemption candidates")
 	podsList := cs.getBoundPods("", "default", true)
 	group := cs.waitingGroups[podgroup]
 	pgMinAvailable := len(group.pods)
@@ -696,15 +695,15 @@ func (cs *Coscheduling) preemptPods(podgroup string) {
 	}
 
 	if freed < pgMinAvailable {
-		klog.V(3).Infof("INFO: No preemption occurred. Not enough nodes are able to be freed")
+		klog.V(3).Infof("No preemption occurred. Not enough nodes are able to be freed")
 		return
 	}
 
 	for _, p := range preemptionCandidates {
-		klog.V(3).Infof("INFO: Preempting pod %s", p.Name)
 		cs.PreemptionTag(p)
 	}
 
+	klog.V(3).Infof("Preemption of lower priority pods is in progress")
 	group.preempting = true
 }
 
