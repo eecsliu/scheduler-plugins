@@ -62,9 +62,9 @@ type Coscheduling struct {
 	// args is coscheduling parameters.
 	args Args
 	// waitingPods is used to track what Pods are currently being scheduled.
-	waitingGroups map[string]*waitingGroup
+	waitingGroups sync.Map
 	// If a podgroup has not been encountered, we refresh our cached information
-	encounteredGroups map[string]bool
+	encounteredGroups sync.Map
 	// creation holds the timestamp the group was last updated. The plugin will check
 	// the status of all podgroups after PodScheduleTimeout seconds. If a PodGroup
 	// has been deleted while it is waiting to be scheduled, it will be replaced
@@ -148,8 +148,8 @@ func New(config *runtime.Unknown, handle framework.FrameworkHandle) (framework.P
 		podLister:     podLister,
 		clock:         util.RealClock{},
 		args:          args,
-		waitingGroups: map[string]*waitingGroup{},
-		encounteredGroups: map[string]bool{},
+		waitingGroups: sync.Map{},
+		encounteredGroups: sync.Map{},
 		creation:      time.Now(),
 	}
 	podInformer := handle.SharedInformerFactory().Core().V1().Pods().Informer()
@@ -285,19 +285,20 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 	pgMinAvailable := pgInfo.minAvailable
 
 	waitingTime := time.Now().Sub(cs.creation)
-	if _, ok := cs.encounteredGroups[pgInfo.name]; !ok {
+	if _, ok := cs.encounteredGroups.Load(pgInfo.name); !ok {
 		klog.V(9).Infof("INFO: encountered a new pod group, refreshing info")
 		cs.getNewWaitingGroups()
 	} else if waitingTime > time.Duration(PodScheduleTimeout)*time.Second {
 		klog.V(9).Infof("INFO: waiting groups timed out, refreshing info")
 		cs.getNewWaitingGroups()
 	}
-	if _, ok := cs.waitingGroups[pgInfo.name]; !ok {
+	if _, ok := cs.waitingGroups.Load(pgInfo.name); !ok {
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable,
 			"PodGroup rejected because it is not ready or higher priority PodGroups exist.")
 	}
 
-	group := cs.waitingGroups[pgInfo.name]
+	groupInterface, _ := cs.waitingGroups.Load(pgInfo.name)
+	group := groupInterface.(*waitingGroup)
 
 	nodesAvailable := cs.calculateAvailableNodes(pgInfo.name)
 
@@ -316,8 +317,8 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 
 	delete(group.pods, pod.Name)
 	if len(group.pods) == 0 {
-		delete(cs.waitingGroups, pgInfo.name)
-		cs.encounteredGroups = map[string]bool{}
+		cs.waitingGroups.Delete(pgInfo.name)
+		cs.encounteredGroups = sync.Map{}
 	} else {
 		group.approved = true
 	}
@@ -460,7 +461,7 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 	// updates cs.waitingGroups to everything that is still alive
 	podsList := cs.getWaitingPods("default")
 	if podsList == nil || len(podsList.Items) == 0 {
-		cs.waitingGroups = map[string]*waitingGroup{}
+		cs.waitingGroups = sync.Map{}
 	}
 	sort.Slice(podsList.Items, func(i, j int) bool {
 		if *podsList.Items[i].Spec.Priority == *podsList.Items[j].Spec.Priority {
@@ -479,8 +480,8 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 		return *podsList.Items[i].Spec.Priority > *podsList.Items[j].Spec.Priority
 	})
 
-	cs.waitingGroups = map[string]*waitingGroup{}
-	cs.encounteredGroups = map[string]bool{}
+	cs.waitingGroups = sync.Map{}
+	cs.encounteredGroups = sync.Map{}
 	var encounteredSelectors []map[string]string
 	candidate := podsList.Items[0]
 	pgName, minAvailable, _ := GetPodGroupLabels(&candidate)
@@ -502,7 +503,7 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 				}
 			}
 			if len(pgPods) == minAvailable && !skip {
-				cs.waitingGroups[pgName] = &waitingGroup{
+				cs.waitingGroups.Store(pgName, &waitingGroup{
 					name:        pgName,
 					pods:        pgPods,
 					preempting:  false,
@@ -510,10 +511,10 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 					priority:    *candidate.Spec.Priority,
 					tolerations: candidate.Spec.Tolerations,
 					selector:    candidate.Spec.NodeSelector,
-				}
+				})
 				encounteredSelectors = append(encounteredSelectors, candidate.Spec.NodeSelector)
 			}
-			cs.encounteredGroups[pgName] = true
+			cs.encounteredGroups.Store(pgName, true)
 			candidate = p
 			pgName, minAvailable, _ = GetPodGroupLabels(&candidate)
 			pgPods = make(map[string]bool, minAvailable)
@@ -532,7 +533,7 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 
 	}
 	if len(pgPods) == minAvailable && !skip { //if length pods is not min available, we aren't ready. If skip, tolerations don't match
-		cs.waitingGroups[pgName] = &waitingGroup{
+		cs.waitingGroups.Store(pgName, &waitingGroup{
 			name:        pgName,
 			pods:        pgPods,
 			preempting:  false,
@@ -540,9 +541,9 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 			priority:    *candidate.Spec.Priority,
 			tolerations: candidate.Spec.Tolerations,
 			selector:    candidate.Spec.NodeSelector,
-		}
+		})
 	}
-	cs.encounteredGroups[pgName] = true
+	cs.encounteredGroups.Store(pgName, true)
 
 	cs.creation = cs.clock.Now()
 }
@@ -655,7 +656,8 @@ func (cs *Coscheduling) doesTolerate(tolerations []v1.Toleration, taints []v1.Ta
 func (cs *Coscheduling) preemptPods(podgroup string) {
 	klog.V(3).Infof("INFO: Preemption required! Finding preemption candidates")
 	podsList := cs.getBoundPods("", "default", true)
-	group := cs.waitingGroups[podgroup]
+	groupInterface, _ := cs.waitingGroups.Load(podgroup)
+	group := groupInterface.(*waitingGroup)
 	pgMinAvailable := len(group.pods)
 
 	sort.Slice(podsList, func(i, j int) bool {
@@ -716,9 +718,12 @@ func (cs *Coscheduling) calculateAvailableNodes(podgroup string) int {
 	}
 
 	nodesAvailable := 0
+	groupInterface, _ := cs.waitingGroups.Load(podgroup)
+	group := groupInterface.(*waitingGroup)
+
 	for _, node := range cs.getAllNodes() {
 		failedSelector := false
-		for k, v := range cs.waitingGroups[podgroup].selector {
+		for k, v := range group.selector {
 			v2, ok := node.Node().Labels[k]
 			if !ok || v != v2 {
 				klog.V(9).Infof("NODE %v doesn't have the right label\n", node.Node().Name)
@@ -734,7 +739,7 @@ func (cs *Coscheduling) calculateAvailableNodes(podgroup string) int {
 		if err != nil {
 			continue
 		}
-		if !cs.doesTolerate(cs.waitingGroups[podgroup].tolerations, taints) {
+		if !cs.doesTolerate(group.tolerations, taints) {
 			klog.V(9).Infof("NODE %v doesn't fit\n", node.Node().Name)
 			continue
 		}
