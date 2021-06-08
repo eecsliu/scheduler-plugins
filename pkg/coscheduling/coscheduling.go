@@ -78,7 +78,7 @@ type Coscheduling struct {
 
 type waitingGroup struct {
 	name        string
-	pods        map[string]bool
+	pods        int
 	preempting  bool
 	approved    bool
 	priority    int32
@@ -321,8 +321,8 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 			}
 		}
 
-		delete(group.pods, pod.Name)
-		if len(group.pods) == 0 {
+		group.pods -= 1
+		if group.pods == 0 {
 			cs.noFit.Store(false)
 			cs.waitingGroups.Delete(pgInfo.name)
 			cs.encounteredGroups = sync.Map{}
@@ -539,7 +539,7 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 	if podsList == nil || len(podsList.Items) == 0 {
 		cs.waitingGroups = sync.Map{}
 	}
-	sort.Slice(podsList.Items, func(i, j int) bool {
+	sort.Slice(podsList.Items, func(i, j int) bool { // TODO: fix this
 		if *podsList.Items[i].Spec.Priority == *podsList.Items[j].Spec.Priority {
 			pgNamei, oki := podsList.Items[i].Labels[PodGroupName]
 			pgNamej, okj := podsList.Items[j].Labels[PodGroupName]
@@ -561,27 +561,31 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 	var encounteredSelectors []map[string]string
 	candidate := podsList.Items[0]
 	pgName, minAvailable, _ := GetPodGroupLabels(&candidate)
-	pgPods := make(map[string]bool, minAvailable)
 	skip := false
 
 	for _, p := range podsList.Items {
 		skip = false
 		candidateGroup, exist := p.Labels[PodGroupName]
 		if exist && candidateGroup == pgName {
-			pgPods[p.Name] = true
+			// if pod has a group, and its group matches the current processed pod group, then continue
+			//pgPods[p.Name] = true
+			continue
 		} else if exist && candidateGroup != pgName {
+			//else if it exists, but the pod group name does not match, we check for selectors for the previous group
 			if len(encounteredSelectors) > 0 {
 				for _, selector := range encounteredSelectors {
+					// if the selector for this job conflicts with a previous selector, we skip it
 					if cs.compareSelectors(candidate.Spec.NodeSelector, selector) {
 						skip = true
 						break
 					}
 				}
+				// if no selectors, continue
 			}
-			if len(pgPods) == minAvailable && !skip {
+			if !skip {
 				cs.waitingGroups.Store(pgName, &waitingGroup{
 					name:        pgName,
-					pods:        pgPods,
+					pods:        minAvailable,
 					preempting:  false,
 					approved:    false,
 					priority:    *candidate.Spec.Priority,
@@ -593,8 +597,6 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 			cs.encounteredGroups.Store(pgName, true)
 			candidate = p
 			pgName, minAvailable, _ = GetPodGroupLabels(&candidate)
-			pgPods = make(map[string]bool, minAvailable)
-			pgPods[p.Name] = true
 		}
 	}
 
@@ -608,10 +610,10 @@ func (cs *Coscheduling) getNewWaitingGroups() {
 		}
 
 	}
-	if len(pgPods) == minAvailable && !skip { //if length pods is not min available, we aren't ready. If skip, tolerations don't match
+	if !skip { //if length pods is not min available, we aren't ready. If skip, tolerations don't match
 		cs.waitingGroups.Store(pgName, &waitingGroup{
 			name:        pgName,
-			pods:        pgPods,
+			pods:        minAvailable,
 			preempting:  false,
 			approved:    false,
 			priority:    *candidate.Spec.Priority,
@@ -734,7 +736,7 @@ func (cs *Coscheduling) preemptPods(podgroup string) {
 	podsList := cs.getBoundPods("", "default", true)
 	groupInterface, _ := cs.waitingGroups.Load(podgroup)
 	group := groupInterface.(*waitingGroup)
-	pgMinAvailable := len(group.pods)
+	pgMinAvailable := group.pods
 
 	sort.Slice(podsList, func(i, j int) bool {
 		if *podsList[i].Spec.Priority == *podsList[j].Spec.Priority {
