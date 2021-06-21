@@ -236,10 +236,8 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		return framework.NewStatus(framework.Success, "")
 	}
 
-	if mapSize(cs.approvedGroups) == 0 {
-		cs.approvedGroups = &sync.Map{}
-		cs.getNewWaitingGroups()
-	}
+	cs.resetApprovedGroups()
+
 	_, ok := cs.approvedGroups.Load(pgInfo.name)
 	if !ok {
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable,
@@ -757,12 +755,17 @@ func (cs *Coscheduling) calculateAvailableNodes(podgroup *waitingGroup) int {
 	return nodesAvailable
 }
 
-// mapSize iterates through a syncMap and returns its size
-func mapSize(syncMap *sync.Map) int {
+// resetApprovedGroups checks the size of approvedGroups and resets it if there is nothing left.
+// a syncMap retains some metadata after key deletion, so resetting to a new map clears everything.
+func (cs *Coscheduling) resetApprovedGroups() {
 	size := 0
-	syncMap.Range(func(key, value interface{}) bool {
+	cs.approvedGroups.Range(func(key, value interface{}) bool {
 		size += 1
 		return true
 	})
-	return size
+
+	if size == 0 {
+		cs.approvedGroups = &sync.Map{}
+		cs.getNewWaitingGroups()
+	}
 }
