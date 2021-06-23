@@ -62,8 +62,9 @@ type Coscheduling struct {
 	clock util.Clock
 	// args is coscheduling parameters.
 	args Args
+	gLock *sync.Mutex
 	// approvedGroups is used to track what Pods are currently being scheduled.
-	approvedGroups *sync.Map
+	approvedGroups map[string]*waitingGroup
 }
 
 type waitingGroup struct {
@@ -141,7 +142,8 @@ func New(config *runtime.Unknown, handle framework.FrameworkHandle) (framework.P
 		podLister:      podLister,
 		clock:          util.RealClock{},
 		args:           args,
-		approvedGroups: &sync.Map{},
+		gLock: 			&sync.Mutex{},
+		approvedGroups: map[string]*waitingGroup{},
 	}
 	podInformer := handle.SharedInformerFactory().Core().V1().Pods().Informer()
 	podInformer.AddEventHandler(
@@ -236,9 +238,13 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		return framework.NewStatus(framework.Success, "")
 	}
 
-	cs.resetApprovedGroups()
+	cs.gLock.Lock()
+	if len(cs.approvedGroups) == 0 {
+		cs.getNewWaitingGroups()
+	}
+	cs.gLock.Unlock()
 
-	_, ok := cs.approvedGroups.Load(pgInfo.name)
+	_, ok := cs.approvedGroups[pgInfo.name]
 	if !ok {
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable,
 			"Pod is too low priority to be scheduled or backfilled")
@@ -259,18 +265,19 @@ func (cs *Coscheduling) Permit(ctx context.Context, state *framework.CycleState,
 		return framework.NewStatus(framework.Success, ""), 0
 	}
 
-	groupInterface, ok := cs.approvedGroups.Load(pgInfo.name)
+	cs.gLock.Lock()
+	group, ok := cs.approvedGroups[pgInfo.name]
 	if !ok {
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable,
 			"Pod is not permitted because it was not approved"), 0
 	}
-	group := groupInterface.(*waitingGroup)
 	group.minAvailable -= 1
 	if group.minAvailable == 0 {
-		cs.approvedGroups.Delete(group.name)
+		delete(cs.approvedGroups, group.name)
 	} else {
-		cs.approvedGroups.Store(group.name, group)
+		cs.approvedGroups[group.name] = group
 	}
+	cs.gLock.Unlock()
 
 	return framework.NewStatus(framework.Success, ""), 0
 }
@@ -370,7 +377,6 @@ func (cs *Coscheduling) podGroupInfoGC() {
 // Backfilling is enabled by default.
 // It updates the approvedGroups map with all the pods that can fit in the cluster.
 func (cs *Coscheduling) getNewWaitingGroups() {
-	cs.approvedGroups = &sync.Map{}
 	hpGroups := map[string]*waitingGroup{}
 	encounteredGroups := map[string]*waitingGroup{}
 	podsList := cs.getWaitingPods("default")
@@ -436,12 +442,12 @@ func (cs *Coscheduling) checkFits(groupsList []*waitingGroup, selectorGroups map
 		numAvailable := cs.calculateAvailableNodes(group)
 
 		if numAvailable >= group.minAvailable {
-			cs.approvedGroups.Store(group.name, group)
+			cs.approvedGroups[group.name] = group
 			availableSlots[group.name] = numAvailable - group.minAvailable
 		} else {
 			ok, slotsFreed := cs.preemptPods(group, numAvailable)
 			if ok {
-				cs.approvedGroups.Store(group.name, group)
+				cs.approvedGroups[group.name] = group
 				availableSlots[group.name] = numAvailable - group.minAvailable + slotsFreed
 			} else {
 				availableSlots[group.name] = numAvailable
@@ -450,9 +456,6 @@ func (cs *Coscheduling) checkFits(groupsList []*waitingGroup, selectorGroups map
 	}
 
 	// backfill action
-	cs.approvedGroups.Range(func(key, value interface{}) bool {
-		return true
-	})
 	for _, group := range groupsList {
 		if _, ok := hpGroups[group.name]; ok {
 			continue
@@ -464,19 +467,16 @@ func (cs *Coscheduling) checkFits(groupsList []*waitingGroup, selectorGroups map
 		}
 
 		if numAvailable >= group.minAvailable {
-			cs.approvedGroups.Store(group.name, group)
+			cs.approvedGroups[group.name] = group
 			availableSlots[selectorGroups[group.name]] -= group.minAvailable
 		} else {
 			ok, slotsFreed := cs.preemptPods(group, numAvailable)
 			if ok {
-				cs.approvedGroups.Store(group.name, group)
+				cs.approvedGroups[group.name] = group
 				availableSlots[group.name] = numAvailable - group.minAvailable + slotsFreed
 			}
 		}
 	}
-	cs.approvedGroups.Range(func(key, value interface{}) bool {
-		return true
-	})
 }
 
 func (cs *Coscheduling) getBoundPods(podGroupName, namespace string, determined bool) []*v1.Pod {
@@ -753,19 +753,4 @@ func (cs *Coscheduling) calculateAvailableNodes(podgroup *waitingGroup) int {
 		}
 	}
 	return nodesAvailable
-}
-
-// resetApprovedGroups checks the size of approvedGroups and resets it if there is nothing left.
-// a syncMap retains some metadata after key deletion, so resetting to a new map clears everything.
-func (cs *Coscheduling) resetApprovedGroups() {
-	size := 0
-	cs.approvedGroups.Range(func(key, value interface{}) bool {
-		size += 1
-		return true
-	})
-
-	if size == 0 {
-		cs.approvedGroups = &sync.Map{}
-		cs.getNewWaitingGroups()
-	}
 }
