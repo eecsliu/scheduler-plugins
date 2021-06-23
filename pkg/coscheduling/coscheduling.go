@@ -268,6 +268,7 @@ func (cs *Coscheduling) Permit(ctx context.Context, state *framework.CycleState,
 	cs.gLock.Lock()
 	group, ok := cs.approvedGroups[pgInfo.name]
 	if !ok {
+		cs.gLock.Unlock()
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable,
 			"Pod is not permitted because it was not approved"), 0
 	}
